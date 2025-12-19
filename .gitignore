@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Data files
+*.csv
+
+# Trained models
+models/
+*.pt
+*.cbm
+*.pkl
+
+# Outputs and logs
+outputs/
+catboost_info/
+
+# IDE / OS
+.vscode/
+.ipynb_checkpoints/

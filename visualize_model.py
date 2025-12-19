@@ -5,9 +5,17 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-from catboost import Pool
+from catboost import Pool, CatBoostClassifier
+import logging
 
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# -----------------------------
+# Helper Functions
+# -----------------------------
 def build_targets(df: pd.DataFrame, target_scheme: str) -> pd.DataFrame:
     df = df.dropna(subset=['susceptibility']).copy()
     sus = df['susceptibility'].astype(str).str.strip().str.title()
@@ -24,7 +32,6 @@ def build_targets(df: pd.DataFrame, target_scheme: str) -> pd.DataFrame:
         df['target_label'] = np.where(df['target'] == 1, 'Non-susceptible', 'Susceptible')
     return df
 
-
 def get_feature_cols(df: pd.DataFrame):
     feature_cols = [
         'medication_category', 'medication_name', 'antibiotic_class', 'ordering_mode',
@@ -34,13 +41,72 @@ def get_feature_cols(df: pd.DataFrame):
     ]
     return [c for c in feature_cols if c in df.columns]
 
+def load_model(model_path: str) -> CatBoostClassifier:
+    if os.path.exists(model_path):
+        with open(model_path, 'rb') as pf:
+            model = pickle.load(pf)
+        logging.info(f"Loaded CatBoost model from {model_path}")
+        return model
+    cbm_fallback = os.path.splitext(model_path)[0] + '.cbm'
+    if os.path.exists(cbm_fallback):
+        model = CatBoostClassifier()
+        model.load_model(cbm_fallback)
+        logging.info(f"Loaded CatBoost model from fallback {cbm_fallback}")
+        return model
+    raise FileNotFoundError("No CatBoost model file found (.pkl or .cbm)")
 
+def plot_boxplot(df: pd.DataFrame, outpath: str):
+    plt.figure(figsize=(8, 5))
+    sns.boxplot(data=df, x='target_label', y='prob_positive')
+    sample = df.sample(min(1000, len(df)), random_state=42)
+    sns.stripplot(data=sample, x='target_label', y='prob_positive', color='black', alpha=0.3, jitter=0.25)
+    plt.title('Predicted Probability by Target')
+    plt.xlabel('Target')
+    plt.ylabel('Predicted P(positive)')
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+    logging.info(f"Saved boxplot to {outpath}")
+
+def plot_scatter(df: pd.DataFrame, outpath: str):
+    if 'age' not in df.columns:
+        logging.warning("Skipping scatter plot: 'age' column not found")
+        return
+    scatter_df = df[['age', 'prob_positive', 'target_label']].dropna()
+    plt.figure(figsize=(8, 5))
+    sns.scatterplot(data=scatter_df.sample(min(5000, len(scatter_df))), x='age', y='prob_positive', hue='target_label', alpha=0.5)
+    plt.title('Predicted Probability vs Age')
+    plt.xlabel('Age')
+    plt.ylabel('Predicted P(positive)')
+    plt.legend(title='Target')
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+    logging.info(f"Saved scatter plot to {outpath}")
+
+def plot_feature_importance(model: CatBoostClassifier, pool: Pool, feature_cols: list, outpath: str, top_n: int = 25):
+    importances = model.get_feature_importance(pool)
+    imp_df = pd.DataFrame({'feature': feature_cols, 'importance': importances})
+    imp_df = imp_df.sort_values('importance', ascending=False).head(top_n)
+    plt.figure(figsize=(10, 6))
+    sns.barplot(data=imp_df, x='importance', y='feature', orient='h')
+    plt.title('Top Feature Importances (CatBoost)')
+    plt.xlabel('Importance')
+    plt.ylabel('Feature')
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+    logging.info(f"Saved feature importance plot to {outpath}")
+
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     parser = argparse.ArgumentParser(description='Visualize CatBoost model predictions and importances')
     parser.add_argument('--model-path', default='models/catboost_resistance_new.pkl', help='Path to pickled CatBoost model')
     parser.add_argument('--csv', default='microbiology_combined_clean.csv', help='Input CSV used for training')
     parser.add_argument('--antibiotic', default=None, help='Optional: filter to a specific antibiotic name')
-    parser.add_argument('--target-scheme', default='binary_rs', choices=['binary_rs', 'binary_ni'], help='Target definition to use for grouping')
+    parser.add_argument('--target-scheme', default='binary_rs', choices=['binary_rs', 'binary_ni'], help='Target definition to use')
     parser.add_argument('--outdir', default='outputs/visualizations', help='Directory to save plots')
     args = parser.parse_args()
 
@@ -48,79 +114,29 @@ def main():
 
     df = pd.read_csv(args.csv, low_memory=False)
     if args.antibiotic:
-        df = df[df['antibiotic'].astype(str) == args.antibiotic]
-    df = build_targets(df, args.target_scheme)
+        df = df[df['antibiotic'].astype(str) == args.antibiotic].copy()
+        logging.info(f"Filtered data to antibiotic: {args.antibiotic} ({len(df)} rows)")
 
+    df = build_targets(df, args.target_scheme)
     feature_cols = get_feature_cols(df)
     X = df[feature_cols].copy()
     cat_features = [i for i, c in enumerate(X.columns) if X[c].dtype == 'object']
     pool = Pool(X, cat_features=cat_features)
 
-    # Load model (.pkl preferred, fallback to .cbm)
-    model = None
-    if os.path.exists(args.model_path):
-        with open(args.model_path, 'rb') as pf:
-            model = pickle.load(pf)
-    else:
-        cbm_fallback = 'models/catboost_resistance_new.cbm'
-        if os.path.exists(cbm_fallback):
-            # Avoid dependency on CatBoost JSON when pickle unavailable; CatBoost can load .cbm via load_model
-            from catboost import CatBoostClassifier
-            model = CatBoostClassifier()
-            model.load_model(cbm_fallback)
-        else:
-            raise FileNotFoundError('No model file found (.pkl or .cbm)')
+    model = load_model(args.model_path)
 
-    # Predict probabilities for positive class
-    probs = model.predict_proba(pool)[:, 1]
-    df['prob_positive'] = probs
+    # Predict probabilities
+    df['prob_positive'] = model.predict_proba(pool)[:, 1]
 
-    # 1) Boxplot: probability by target label
-    plt.figure(figsize=(8, 5))
-    sns.boxplot(data=df, x='target_label', y='prob_positive')
-    sns.stripplot(data=df.sample(min(1000, len(df))), x='target_label', y='prob_positive', color='black', alpha=0.3, jitter=0.25)
-    plt.title('Predicted Probability by Target')
-    plt.xlabel('Target')
-    plt.ylabel('Predicted P(positive)')
-    plt.tight_layout()
-    boxplot_path = os.path.join(args.outdir, 'boxplot_target_probs.png')
-    plt.savefig(boxplot_path, dpi=150)
-    plt.close()
+    # Save predictions
+    pred_csv = os.path.join(args.outdir, 'predictions_with_probs.csv')
+    df.to_csv(pred_csv, index=False)
+    logging.info(f"Saved predictions CSV to {pred_csv}")
 
-    # 2) Scatterplot: age vs probability
-    if 'age' in df.columns:
-        scatter_df = df[['age', 'prob_positive', 'target_label']].dropna()
-        plt.figure(figsize=(8, 5))
-        sns.scatterplot(data=scatter_df.sample(min(5000, len(scatter_df))), x='age', y='prob_positive', hue='target_label', alpha=0.5)
-        plt.title('Predicted Probability vs Age')
-        plt.xlabel('Age')
-        plt.ylabel('Predicted P(positive)')
-        plt.legend(title='Target')
-        plt.tight_layout()
-        scatter_path = os.path.join(args.outdir, 'scatter_age_probs.png')
-        plt.savefig(scatter_path, dpi=150)
-        plt.close()
-
-    # 3) Bar graph: feature importances
-    importances = model.get_feature_importance(pool)
-    imp_df = pd.DataFrame({'feature': feature_cols, 'importance': importances})
-    imp_df = imp_df.sort_values('importance', ascending=False).head(25)
-    plt.figure(figsize=(10, 6))
-    sns.barplot(data=imp_df, x='importance', y='feature', orient='h')
-    plt.title('Top Feature Importances (CatBoost)')
-    plt.xlabel('Importance')
-    plt.ylabel('Feature')
-    plt.tight_layout()
-    bar_path = os.path.join(args.outdir, 'bar_feature_importance.png')
-    plt.savefig(bar_path, dpi=150)
-    plt.close()
-
-    print('Saved:')
-    print(f' - {boxplot_path}')
-    if 'age' in df.columns:
-        print(f' - {scatter_path}')
-    print(f' - {bar_path}')
-
+    # Plots
+    plot_boxplot(df, os.path.join(args.outdir, 'boxplot_target_probs.png'))
+    plot_scatter(df, os.path.join(args.outdir, 'scatter_age_probs.png'))
+    plot_feature_importance(model, pool, feature_cols, os.path.join(args.outdir, 'bar_feature_importance.png'))
 
 if __name__ == '__main__':
     main()
